@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose 项目无需 MDC 依赖，直接基于平台主题做无 ActionBar 基底 -->
+    <style name="Theme.BtMouse" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowSoftInputMode">adjustResize</item>
+    </style>
+</resources>
