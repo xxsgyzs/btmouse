@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.btmouse.MainActivity
@@ -38,6 +39,13 @@ class HidForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Android 14 (API 34) 要求：foregroundServiceType=connectedDevice 的服务在调用
+        // startForeground() 前必须已获得 BLUETOOTH_CONNECT 等蓝牙运行时权限，否则抛
+        // SecurityException 并导致进程崩溃。未授权时先不转前台，等 UI 授权后重启服务。
+        if (!canStartForeground()) {
+            Log.w(TAG, "缺少蓝牙运行时权限，暂不进入前台；授权后需重新启动服务")
+            return START_NOT_STICKY
+        }
         startAsForeground()
         // 确保蓝牙 HID Profile 初始化；若已在运行则为幂等操作
         manager.initialize()
@@ -97,8 +105,18 @@ class HidForegroundService : Service() {
         super.onDestroy()
     }
 
+    /** 是否具备进入前台服务所需的蓝牙运行时权限。 */
+    private fun canStartForeground(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        return ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.BLUETOOTH_CONNECT
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
     companion object {
         private const val CHANNEL_ID = "hid_foreground_service"
+        private const val TAG = "HidForegroundService"
         private const val NOTIFICATION_ID = 1001
 
         /** 供 Activity 启动前台服务（对 Android 8+ 用 startForegroundService，系统会在 5s 内要求转前台）。 */
@@ -108,3 +126,4 @@ class HidForegroundService : Service() {
         }
     }
 }
+
