@@ -4,6 +4,7 @@ import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothProfile
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -36,6 +37,10 @@ import kotlinx.coroutines.launch
  *     传感器驱动将在 BATCH-3/BATCH-4 通过 SensorMouseController 接入本类
  */
 class MainViewModel(app: Application) : AndroidViewModel(app) {
+
+    private companion object {
+        private const val TAG = "MainViewModel"
+    }
 
     private val manager: BluetoothHidManager
         get() = BluetoothHidManager.getInstance(getApplication<Application>())
@@ -102,9 +107,37 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
-        // 启动并初始化蓝牙 HID（前台服务保活 + Profile 获取）
+        // 先检查运行时权限：缺少 BLUETOOTH_CONNECT 时不能启动前台服务、也不能注册 HID，
+        // 否则在 Android 12+ 上会抛 SecurityException 导致"一打开就闪退"。
+        if (canUseBluetooth()) {
+            startBluetoothStack()
+        } else {
+            Log.w(TAG, "蓝牙权限未授予，等待用户在连接页授权后启动 HID")
+        }
+    }
+
+    /** 当前是否具备使用蓝牙 HID 的运行时权限（Android 12+ 需要 BLUETOOTH_CONNECT）。 */
+    fun canUseBluetooth(): Boolean = manager.canRegisterHid()
+
+    /**
+     * 启动蓝牙链路：初始化 HID Profile + 启动前台服务保活。
+     *
+     * 幂等：重复调用安全（getProfileProxy 与 startForegroundService 都可重复执行）。
+     * 由 init（已授权时）或连接页授权成功后调用。
+     */
+    fun startBluetoothStack() {
+        if (!canUseBluetooth()) {
+            Log.w(TAG, "startBluetoothStack 被调用但权限仍缺失，忽略")
+            return
+        }
         manager.initialize()
         HidForegroundService.start(getApplication())
+    }
+
+    /** 权限授予后调用：启动蓝牙链路，并在 HID 服务已就绪时补注册一次。 */
+    fun onBluetoothPermissionGranted() {
+        startBluetoothStack()
+        manager.registerAsHidDevice()
     }
 
     override fun onCleared() {
