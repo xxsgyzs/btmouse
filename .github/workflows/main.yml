@@ -1,0 +1,56 @@
+name: Android Debug Build
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: btmouse-staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        id: android-sdk
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 'latest'
+          platforms: 'android-34'
+          build-tools: '34.0.0'
+
+      - name: Create local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > btmouse-staging/local.properties
+        shell: bash
+
+      - name: Set up Gradle 8.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+
+      - name: Generate Gradle Wrapper (project missing wrapper)
+        run: gradle wrapper --gradle-version 8.2 --distribution-type bin
+        shell: bash
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+        shell: bash
+
+      - name: Build Debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: btmouse-staging/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
