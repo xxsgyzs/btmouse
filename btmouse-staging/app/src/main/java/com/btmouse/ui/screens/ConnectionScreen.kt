@@ -69,7 +69,10 @@ fun ConnectionScreen(
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
-        if (PermissionHelper.hasAll(context)) vm.refreshBonded()
+        if (PermissionHelper.hasAll(context)) {
+            // 授权成功：此时才能安全启动前台服务与 HID 注册（否则 Android 12+ 会 SecurityException 崩溃）
+            vm.onBluetoothPermissionGranted()
+        }
     }
 
     // 首次进入：若缺少权限则发起申请
@@ -78,6 +81,7 @@ fun ConnectionScreen(
         if (missing.isNotEmpty()) {
             permissionLauncher.launch(missing.toTypedArray())
         } else {
+            vm.startBluetoothStack()
             vm.refreshBonded()
         }
     }
@@ -292,4 +296,3 @@ private val BackArrowIcon: ImageVector = connectionIcon("BackArrow") {
     moveTo(19f, 12f); lineTo(5f, 12f)
     moveTo(11f, 6f); lineTo(5f, 12f); lineTo(11f, 18f)
 }
-
