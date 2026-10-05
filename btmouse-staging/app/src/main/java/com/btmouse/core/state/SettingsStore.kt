@@ -3,9 +3,24 @@ package com.btmouse.core.state
 import android.content.Context
 
 /**
+ * ScrollConfig —— 滚轮映射参数
+ *
+ * 由持久的 [MouseSettings] 构造，供两条输入通路**共用同一套参数**：
+ *  - 触控板双指滑动（[com.btmouse.core.input.TouchInputHandler]）
+ *  - 体感模式的滚轮条（[com.btmouse.core.sensors.SensorMouseController]）
+ *
+ * @property pixelsPerClick 多少像素折算 1 格滚轮（越小滚得越快）
+ * @property direction      滚轮方向（1 或 -1）。若电脑端上下方向相反，改成 -1 即可。
+ */
+data class ScrollConfig(
+    val pixelsPerClick: Float = 40f,
+    val direction: Float = 1f
+)
+
+/**
  * MouseSettings —— 手感相关参数
  *
- * @property sensitivity       灵敏度倍率（1.0 为基准，越大光标越快）
+ * @property sensitivity       灵敏度倍率（1.0 为基准，越大光标越快；对所有模式生效）
  * @property smoothing         平滑下限 0..1（越大越跟手；高速时内部 alpha 会自动升到 1.0）
  * @property pixelsPerScrollClick 滚轮：多少像素折算 1 格（越小滚得越快）
  * @property scrollDirection   滚轮方向（1 或 -1）。若电脑端上下滚动方向相反，改成 -1 即可。
@@ -15,7 +30,13 @@ data class MouseSettings(
     val smoothing: Float = 0.6f,
     val pixelsPerScrollClick: Float = 40f,
     val scrollDirection: Float = 1f
-)
+) {
+    /** 转成滚轮算法共用的配置对象。 */
+    fun toScrollConfig(): ScrollConfig = ScrollConfig(
+        pixelsPerClick = pixelsPerScrollClick,
+        direction = scrollDirection
+    )
+}
 
 /**
  * SettingsStore —— 手感参数的本地持久化
