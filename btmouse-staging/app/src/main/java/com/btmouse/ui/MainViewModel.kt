@@ -13,6 +13,7 @@ import androidx.lifecycle.viewModelScope
 import com.btmouse.core.hid.BluetoothHidManager
 import com.btmouse.core.hid.MouseReportBuilder
 import com.btmouse.core.input.TouchInputHandler
+import com.btmouse.core.sensors.SensorMouseController
 import com.btmouse.core.state.HidMode
 import com.btmouse.core.state.ModeStore
 import com.btmouse.core.state.MouseSettings
@@ -24,17 +25,19 @@ import kotlinx.coroutines.launch
 /**
  * MainViewModel —— 应用状态机
  *
- * 统一持有 BluetoothHidManager 单例与 TouchInputHandler（像素→逻辑位移+自适应滤波），
- * 向 Compose 暴露：模式选择、连接状态、配对列表、手感参数。
+ * 统一持有 BluetoothHidManager 单例、TouchInputHandler（像素→逻辑位移）与
+ * SensorMouseController（体感位移），向 Compose 暴露：模式选择、连接状态、配对列表、手感参数。
  *
- * 数据流（保持与原实现一致，未触碰 HID 底层）：
- *   触控/按键 → TouchInputHandler(死区+自适应EMA+残差累积) → TouchInputHandler.submit
- *             → manager.submitMouseInput() → SendQueue(自适应节拍+拆帧) → sendReport
+ * 数据流（两条入口，汇入同一条 HID 通路）：
+ *   触控/按键 → TouchInputHandler(死区+自适应EMA+残差累积) ─┐
+ *   传感器    → SensorMouseController(低通+死区+ZUPT+阻尼) ─┤
+ *                                                          └→ manager.submitMouseInput/submitWheel
+ *                                                             → SendQueue(节拍+拆帧) → sendReport
  *
  * 模式说明：
- *   - [HidMode.TRACKPAD]：触摸直接产生位移，本类已完全可用
- *   - [HidMode.DESK] / [HidMode.AIR]：布局与按键、滚轮已可用；
- *     传感器驱动将在 BATCH-3/BATCH-4 通过 SensorMouseController 接入本类
+ *   - [HidMode.TRACKPAD]：触摸直接产生位移（含双指滚轮）
+ *   - [HidMode.DESK]：加速度计积分位移（桌面平放推拉）
+ *   - [HidMode.AIR]：陀螺仪角速度映射（手持悬空转动）
  */
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -61,9 +64,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 触控位移处理器：把像素增量转成滤波后的逻辑位移，并透传当前按钮状态到发送队列。
      * buttons 采用位掩码（可用 | 组合），按下/抬起即时提交。
+     *
+     * wheel 参数在 BATCH-3 接入，用于双指滑动滚轮。
      */
     private val touchHandler = TouchInputHandler(
-        submit = { dx, dy, buttons -> manager.submitMouseInput(dx, dy, buttons) }
+        submit = { dx, dy, buttons, wheel ->
+            manager.submitMouseInput(dx, dy, buttons, wheel)
+        }
+    )
+
+    /**
+     * 体感控制器（模式二/三）。回调运行在其内部后台线程；
+     * manager.submitMouseInput 本身线程安全（内部 post 到 SendQueue 线程），故无需切线程。
+     */
+    private val sensorController = SensorMouseController(
+        context = app,
+        onCursorDelta = { dx, dy -> submitSensorDelta(dx, dy) },
+        onScrollDelta = { dyPx -> touchHandler.onScroll(0f, dyPx) }
     )
 
     // ---------------- 可观察状态 ----------------
@@ -84,8 +101,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var bondedDevices by mutableStateOf<List<BluetoothDevice>>(emptyList())
         private set
 
+    /** 当前模式的传感器是否可用（供 UI 提示"本机不支持陀螺仪"）。 */
+    var sensorAvailable by mutableStateOf(true)
+        private set
+
     init {
-        // 把持久化的手感立即应用到处理器（含灵敏度 / 平滑下限）
+        // 把持久化的手感立即应用到处理器（含灵敏度 / 平滑下限 / 滚轮参数）
         applySettingsToHandler()
 
         // 订阅蓝牙状态（回调在 HID 线程，需切回主线程更新 UI）
@@ -114,6 +135,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         } else {
             Log.w(TAG, "蓝牙权限未授予，等待用户在连接页授权后启动 HID")
         }
+
+        // 恢复到上次选择的模式（若为体感模式则直接启动传感器）
+        applyMode(currentMode, persist = false)
     }
 
     /** 当前是否具备使用蓝牙 HID 的运行时权限（Android 12+ 需要 BLUETOOTH_CONNECT）。 */
@@ -142,20 +166,40 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         // 蓝牙 HID Profile 由前台服务持有；为不打断连接，ViewModel 销毁时不释放 manager。
+        // 传感器必须停：否则 Activity 结束后仍在耗电。
+        sensorController.stop()
         super.onCleared()
     }
 
     // ---------------- 模式切换 ----------------
 
     /**
-     * 切换操作模式：持久化 + 更新 UI 状态 + 清空滤波残差。
+     * 切换操作模式：更新状态 + 持久化 + 启停传感器 + 清空滤波残差。
+     *
      * 清空残差是为了避免切换瞬间把上一模式累积的小数位移带进新模式。
      */
     fun selectMode(mode: HidMode) {
         if (mode == currentMode) return
+        applyMode(mode, persist = true)
+    }
+
+    private fun applyMode(mode: HidMode, persist: Boolean) {
         currentMode = mode
-        ModeStore.save(getApplication(), mode)
+        if (persist) ModeStore.save(getApplication(), mode)
+
         touchHandler.reset()
+
+        if (mode.sensorBased) {
+            sensorAvailable = sensorController.isAvailable(mode)
+            if (sensorAvailable) {
+                sensorController.start(mode)
+            } else {
+                Log.w(TAG, "模式 $mode 的传感器在本机不可用")
+            }
+        } else {
+            sensorAvailable = true
+            sensorController.stop()
+        }
     }
 
     // ---------------- 手感参数 ----------------
@@ -194,12 +238,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 把参数注入 TouchInputHandler 的公开属性。
-     * TouchInputHandler 的 onDrag 每次都会读取这些属性，因此是**实时生效**的。
+     * 把参数注入两个处理器的公开属性。
+     * 它们每次运算都会读取这些属性，因此是**实时生效**的。
      */
     private fun applySettingsToHandler() {
         touchHandler.sensitivity = settings.sensitivity
         touchHandler.smoothing = settings.smoothing
+        touchHandler.scrollConfig = settings.toScrollConfig()
     }
 
     // ---------------- 连接管理 ----------------
@@ -235,15 +280,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         touchHandler.buttons = applyButton(MouseReportBuilder.BUTTON_RIGHT, pressed)
     }
 
-    /** 提交移动增量（dx/dy 为像素位移），由 TouchInputHandler 滤波后发送。 */
+    /**
+     * 提交移动增量（dx/dy 为像素位移），由 TouchInputHandler 滤波后发送。
+     * 供模式一（触控板）使用。
+     */
     fun submitMove(dxPx: Float, dyPx: Float) {
         touchHandler.onDrag(dxPx, dyPx)
     }
 
+    /**
+     * 提交双指滚动（像素位移），由 TouchInputHandler 换算成滚轮格数。
+     * 供模式一（触控板双指滑动）与模式二/三（滚轮条）使用。
+     */
+    fun submitScroll(dxPx: Float, dyPx: Float) {
+        touchHandler.onScroll(dxPx, dyPx)
+    }
 
-    // 滚轮：报告的第 4 字节（wheel）已由 SendQueue / MouseReportBuilder 支持，
-    // 但 BluetoothHidManager.submitMouseInput() 的公开签名目前只有 (dx, dy, buttons)。
-    // 按要求不在本批次改动 HID 层，故滚轮发送与双指手势一并在 BATCH-3 接入。
+    /**
+     * 体感模式的光标位移：做亚像素累积后取整发出。
+     *
+     * 传感器以浮点速度积分出像素，若直接取整会丢掉小数（与触控通路同一问题），
+     * 因此在 ViewModel 这一层统一累积。
+     */
+    private var sensorResidualX = 0f
+    private var sensorResidualY = 0f
+
+    private fun submitSensorDelta(dxPx: Float, dyPx: Float) {
+        val posX = dxPx + sensorResidualX
+        val posY = dyPx + sensorResidualY
+        val outX = posX.toInt()
+        val outY = posY.toInt()
+        sensorResidualX = posX - outX
+        sensorResidualY = posY - outY
+
+        if (outX != 0 || outY != 0) {
+            manager.submitMouseInput(outX, outY, touchHandler.buttons, 0)
+        }
+    }
 
     /** 更新按钮掩码：pressed 则置位，否则清位。 */
     private fun applyButton(mask: Int, pressed: Boolean): Int = if (pressed) {
@@ -252,4 +325,3 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         touchHandler.buttons and mask.inv()
     }
 }
-
