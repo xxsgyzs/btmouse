@@ -1,5 +1,4 @@
 package com.btmouse.core.hid
-
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHidDevice
@@ -10,7 +9,6 @@ import android.content.Context
 import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-
 /**
  * BluetoothHIDManager
  *
@@ -32,46 +30,35 @@ import java.util.concurrent.Executors
  */
 class BluetoothHidManager private constructor(context: Context) {
     private val appContext = context.applicationContext
-
     /** HID 回调与注册所用到的并发执行器（Android 官方要求传入，用于异步回调线程调度） */
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
-
     /** 当前已绑定的 HID Profile 实例；未就绪时为 null（跨线程访问，需 volatile） */
     @Volatile
     private var hidDevice: BluetoothHidDevice? = null
-
     /** 当前与远端连接的蓝牙设备；未连接时为 null（跨线程访问，需 volatile） */
     @Volatile
     private var connectedDevice: BluetoothDevice? = null
-
     /** 发送节流队列：把高频输入增量合并成定时 report 发送（见 SendQueue）。 */
     private val sendQueue by lazy { SendQueue(sendReport = { sendMouseReport(it) }) }
-
     /** 当前已按下的虚拟按钮状态（左/右/中掩码）；供 UI 层通过按钮组件更新。 */
     @Volatile
     var buttons: Int = 0
         private set
-
     /** 应用是否已成功注册为 HID 设备（registerApp 成功） */
     @Volatile
     var isAppRegistered: Boolean = false
         private set
-
     /** 对外暴露的连接状态监听，供 UI 层更新界面 */
     var listener: HidStateListener? = null
-
     companion object {
         private const val TAG = "BluetoothHidManager"
-
         /** 单例 */
         @Volatile
         private var instance: BluetoothHidManager? = null
-
         fun getInstance(context: Context): BluetoothHidManager =
             instance ?: synchronized(this) {
                 instance ?: BluetoothHidManager(context.applicationContext).also { instance = it }
             }
-
         /**
          * HID Report Descriptor（汇报描述符），共 52 字节。
          *
@@ -115,7 +102,6 @@ class BluetoothHidManager private constructor(context: Context) {
             0x75, 0x08, 0x95, 0x03, 0x81.toByte(), 0x06,
             0xC0.toByte(), 0xC0.toByte()
         )
-
         /**
          * 鼠标 HID Input Report 的字节索引常量。
          * 报告固定 4 字节（结合 Data Report 布局）：
@@ -129,16 +115,13 @@ class BluetoothHidManager private constructor(context: Context) {
         const val IDX_X = 1
         const val IDX_Y = 2
         const val IDX_WHEEL = 3
-
         /** 按钮位掩码 */
         const val BUTTON_NONE = 0x00
         const val BUTTON_LEFT = 0x01
         const val BUTTON_RIGHT = 0x02
         const val BUTTON_MIDDLE = 0x04
     }
-
     // ---------------- 对外状态监听接口 ----------------
-
     /**
      * 连接状态监听。UI 层实现它来驱动界面（如"未连接/已注册/已连接"切换）。
      */
@@ -150,9 +133,7 @@ class BluetoothHidManager private constructor(context: Context) {
         /** 连接状态变化：device 为目标设备，state 用 BluetoothProfile.STATE_* 表示 */
         fun onConnectionStateChanged(device: BluetoothDevice?, state: Int)
     }
-
     // ---------------- 初始化：获取 HID Profile ----------------
-
     /**
      * 通过 getProfileProxy 异步获取 BluetoothHidDevice Profile。
      * 结果在 [profileServiceListener.onServiceConnected] 回调中获得。
@@ -172,7 +153,6 @@ class BluetoothHidManager private constructor(context: Context) {
             BluetoothProfile.HID_DEVICE
         )
     }
-
     /**
      * Profile 连接服务监听。系统将 HID_DEVICE Profile 绑定给本应用时回调。
      */
@@ -186,7 +166,6 @@ class BluetoothHidManager private constructor(context: Context) {
                 registerAsHidDevice()
             }
         }
-
         override fun onServiceDisconnected(profile: Int) {
             if (profile == BluetoothProfile.HID_DEVICE) {
                 hidDevice = null
@@ -195,9 +174,7 @@ class BluetoothHidManager private constructor(context: Context) {
             }
         }
     }
-
     // ---------------- 注册为 HID 设备 ----------------
-
     /**
      * 把本机注册成一个 HID Device（鼠标）。
      *
@@ -228,7 +205,6 @@ class BluetoothHidManager private constructor(context: Context) {
         // outQos 传 null 表示使用默认出站 QoS。
         device.registerApp(sdp, qos, null, executor, hidCallback)
     }
-
     /**
      * HID 设备回调，接收注册结果与连接状态。
      */
@@ -238,7 +214,6 @@ class BluetoothHidManager private constructor(context: Context) {
             Log.i(TAG, "onAppStatusChanged registered=$registered device=${pluggedDevice?.address}")
             listener?.onAppRegistered(registered)
         }
-
         override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
             connectedDevice = when (state) {
                 BluetoothProfile.STATE_CONNECTED -> device
@@ -247,16 +222,13 @@ class BluetoothHidManager private constructor(context: Context) {
             Log.i(TAG, "onConnectionStateChanged state=$state device=${device.address}")
             listener?.onConnectionStateChanged(device, state)
         }
-
         // 以下回调在本项目中不涉及数据交换（纯输出设备），保留空实现即可。
         override fun onGetReport(device: BluetoothDevice, type: Byte, id: Byte, bufferSize: Int) {}
         override fun onSetReport(device: BluetoothDevice, type: Byte, id: Byte, data: ByteArray) {}
         override fun onVirtualCableUnplug(device: BluetoothDevice) {}
         override fun onProtocolMode(device: BluetoothDevice, protocolMode: Byte) {}
     }
-
     // ---------------- 连接管理 ----------------
-
     /**
      * 主动向某个已配对设备发起 HID 连接。
      * @param device 远端电脑（已通过系统蓝牙配对）。
@@ -265,7 +237,6 @@ class BluetoothHidManager private constructor(context: Context) {
         val hid = hidDevice ?: return false
         return hid.connect(device)
     }
-
     /**
      * 断开与远端设备的连接。
      */
@@ -273,12 +244,9 @@ class BluetoothHidManager private constructor(context: Context) {
         val hid = hidDevice ?: return false
         return hid.disconnect(device)
     }
-
     /** 当前与远端连接的设备 */
     fun getConnectedDevice(): BluetoothDevice? = connectedDevice
-
     // ---------------- 输入上报入口（供 UI / 触控层调用） ----------------
-
     /**
      * 提交一次鼠标位移增量 + 按钮状态。高频调用，由内部 SendQueue 节流合并发送。
      * 任意线程均可调用，内部会 dispatch 到队列线程。
@@ -287,9 +255,7 @@ class BluetoothHidManager private constructor(context: Context) {
         this.buttons = buttons
         sendQueue.submitMouse(dx, dy, buttons)
     }
-
     // ---------------- 发送报告 ----------------
-
     /**
      * 发送一条 HID Input Report 给远端（电脑）。
      *
@@ -307,7 +273,6 @@ class BluetoothHidManager private constructor(context: Context) {
         // 第二个参数为 Report ID；描述符未声明 Report ID，故传 0
         return hid.sendReport(device, 0, report)
     }
-
     /**
      * 释放 Profile 资源，在服务销毁时调用，避免泄漏。
      */
@@ -315,7 +280,7 @@ class BluetoothHidManager private constructor(context: Context) {
         hidDevice?.let { BluetoothAdapter.getDefaultAdapter()?.closeProfileProxy(BluetoothProfile.HID_DEVICE, it) }
         hidDevice = null
         connectedDevice = null
-        if (::sendQueue.isInitialized) sendQueue.release()
+        sendQueue.release()
         instance = null
         executor.shutdown()
     }
