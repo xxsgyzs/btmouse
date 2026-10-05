@@ -312,10 +312,24 @@ class BluetoothHidManager private constructor(context: Context) {
     /**
      * 提交一次鼠标位移增量 + 按钮状态。高频调用，由内部 SendQueue 节流合并发送。
      * 任意线程均可调用，内部会 dispatch 到队列线程。
+     *
+     * @param wheel 滚轮格数（正负表示方向），0 表示本帧不带滚轮
      */
-    fun submitMouseInput(dx: Int, dy: Int, buttons: Int) {
+    @JvmOverloads
+    fun submitMouseInput(dx: Int, dy: Int, buttons: Int, wheel: Int = 0) {
         this.buttons = buttons
-        sendQueue.submitMouse(dx, dy, buttons)
+        sendQueue.submitMouse(dx, dy, buttons, wheel)
+    }
+
+    /**
+     * 只提交滚轮、不携带位移。
+     *
+     * 单独提供是为了语义清晰：滚轮帧若同时带位移，主机可能视为拖拽（会选中文本）。
+     * 内部复用同一个 SendQueue，不引入新的发送通路。
+     */
+    fun submitWheel(clicks: Int) {
+        if (clicks == 0) return
+        sendQueue.submitMouse(0, 0, buttons, clicks)
     }
 
     // ---------------- 发送报告 ----------------
