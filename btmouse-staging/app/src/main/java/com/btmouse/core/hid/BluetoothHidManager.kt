@@ -31,7 +31,6 @@ import java.util.concurrent.Executors
  *   manager.sendMouseReport(reportBytes)          // 4. 发送鼠标 report
  */
 class BluetoothHidManager private constructor(context: Context) {
-
     private val appContext = context.applicationContext
 
     /** HID 回调与注册所用到的并发执行器（Android 官方要求传入，用于异步回调线程调度） */
@@ -103,18 +102,18 @@ class BluetoothHidManager private constructor(context: Context) {
          *  0xC0 0xC0          —— End Collection：关闭物理集合与应用集合
          */
         private val HID_REPORT_DESCRIPTOR = byteArrayOf(
-            0x05, 0x01, 0x09, 0x02, 0xA1, 0x01,
-            0x09, 0x01, 0xA1, 0x00,
+            0x05, 0x01, 0x09, 0x02, 0xA1.toByte(), 0x01,
+            0x09, 0x01, 0xA1.toByte(), 0x00,
             0x05, 0x09,
             0x19, 0x01, 0x29, 0x03,
             0x15, 0x00, 0x25, 0x01,
-            0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
-            0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
+            0x95, 0x03, 0x75, 0x01, 0x81.toByte(), 0x02,
+            0x95, 0x01, 0x75, 0x05, 0x81.toByte(), 0x01,
             0x05, 0x01,
             0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
-            0x15, 0x81, 0x25, 0x7F,
-            0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
-            0xC0, 0xC0
+            0x15, 0x81.toByte(), 0x25, 0x7F,
+            0x75, 0x08, 0x95, 0x03, 0x81.toByte(), 0x06,
+            0xC0.toByte(), 0xC0.toByte()
         )
 
         /**
@@ -209,7 +208,6 @@ class BluetoothHidManager private constructor(context: Context) {
      */
     fun registerAsHidDevice() {
         val device = hidDevice ?: return
-
         val sdp = BluetoothHidDeviceAppSdpSettings(
             "BT Mouse",                        // 设备名称，主机端显示
             "Android BLE HID Mouse",           // 描述
@@ -217,7 +215,6 @@ class BluetoothHidManager private constructor(context: Context) {
             BluetoothHidDevice.SUBCLASS1_MOUSE,// SDP 子类：鼠标
             HID_REPORT_DESCRIPTOR              // HID 描述符
         )
-
         // QoS 使用"最低时延"优先：降低输入延迟、换取低功耗（适合 HID 鼠标高频上报）
         val qos = BluetoothHidDeviceAppQosSettings(
             BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT,
@@ -226,9 +223,10 @@ class BluetoothHidManager private constructor(context: Context) {
             0,
             1
         )
-
-        // 异步注册，结果通过 hidCallback.onAppStatusChanged 回调
-        device.registerApp(sdp, qos, executor, hidCallback)
+        // Android 11 (API 30) 的 registerApp 为 5 参数签名：
+        //   registerApp(sdp, inQos, outQos, executor, callback)
+        // outQos 传 null 表示使用默认出站 QoS。
+        device.registerApp(sdp, qos, null, executor, hidCallback)
     }
 
     /**
@@ -254,7 +252,7 @@ class BluetoothHidManager private constructor(context: Context) {
         override fun onGetReport(device: BluetoothDevice, type: Byte, id: Byte, bufferSize: Int) {}
         override fun onSetReport(device: BluetoothDevice, type: Byte, id: Byte, data: ByteArray) {}
         override fun onVirtualCableUnplug(device: BluetoothDevice) {}
-        override fun onProtocolMode(device: BluetoothDevice, protocolMode: Int) {}
+        override fun onProtocolMode(device: BluetoothDevice, protocolMode: Byte) {}
     }
 
     // ---------------- 连接管理 ----------------
