@@ -1,5 +1,6 @@
 package com.btmouse.core.input
 
+import com.btmouse.core.state.ScrollConfig
 import kotlin.math.sqrt
 
 /**
@@ -25,10 +26,16 @@ import kotlin.math.sqrt
  * @param smoothing   平滑下限 0..1（越大越跟手；高速时 alpha 自动升到 1.0）
  */
 class TouchInputHandler(
-    private val submit: (dx: Int, dy: Int, buttons: Int) -> Unit,
+    private val submit: (dx: Int, dy: Int, buttons: Int, wheel: Int) -> Unit,
     @Volatile var sensitivity: Float = 1.0f,
     @Volatile var smoothing: Float = 0.6f
 ) {
+
+    /**
+     * 滚轮映射配置。触控板双指滚动与体感滚轮条共用同一份（由 MainViewModel 注入）。
+     */
+    @Volatile
+    var scrollConfig: ScrollConfig = ScrollConfig()
 
     companion object {
         /** 死区阈值（像素）：小于该值的位移忽略，抑制手指颤动的微响应。 */
@@ -50,7 +57,7 @@ class TouchInputHandler(
         set(value) {
             field = value
             // 按下/抬起必须即时发出，不等节拍：直接提交一次纯按钮事件
-            submit(0, 0, value)
+            submit(0, 0, value, 0)
         }
 
     /** 上一次平滑后的逻辑位移（供 EMA 使用） */
@@ -60,6 +67,9 @@ class TouchInputHandler(
     /** 亚像素残差：本帧未满 1px 的部分留到下一帧，避免细微移动被截断丢弃。 */
     private var residualX = 0f
     private var residualY = 0f
+
+    /** 滚轮残差：未满 1 格的零头留到下一帧，保证慢速滚动也能生效。 */
+    private var scrollResidual = 0f
 
     /**
      * 由 Compose/原生触摸回调调用，传入本帧的像素位移（float 保留亚像素精度）。
@@ -92,7 +102,34 @@ class TouchInputHandler(
         residualY = (posY - outY).coerceIn(-MAX_RESIDUAL, MAX_RESIDUAL)
 
         if (outX != 0 || outY != 0) {
-            submit(outX, outY, buttons)
+            submit(outX, outY, buttons, 0)
+        }
+    }
+
+    /**
+     * 滚轮入口：双指竖直滑动 → 滚轮格数（由 TouchpadScreen 的双指手势调用）。
+     *
+     * 与光标位移一样做**残差累积**：慢速滑动时不足 1 格的零头会留到下一帧，
+     * 不会因为 toInt() 截断而永远滚不动。
+     *
+     * @param dxPx 双指横向像素增量（当前 HID 描述符无横向滚轮，暂不使用）
+     * @param dyPx 双指纵向像素增量（屏幕坐标，向下为正）
+     */
+    fun onScroll(dxPx: Float, dyPx: Float) {
+        @Suppress("UNUSED_VARIABLE")
+        val unusedDx = dxPx // 预留：描述符暂无 AC Pan（横向滚轮）
+
+        val cfg = scrollConfig
+        // 屏幕 Y 向下为正；"手指下滑 = 内容上移"，故取负，再乘方向常量
+        val raw = -dyPx / cfg.pixelsPerClick * cfg.direction * sensitivity
+
+        val pos = raw + scrollResidual
+        val out = truncate(pos)
+        scrollResidual = (pos - out).coerceIn(-MAX_RESIDUAL, MAX_RESIDUAL)
+
+        if (out != 0) {
+            // 只发滚轮、不带位移：若同时带位移，主机可能把这一帧当作拖拽（会选中文本）
+            submit(0, 0, buttons, out)
         }
     }
 
@@ -105,5 +142,7 @@ class TouchInputHandler(
         prevSmoothedY = 0f
         residualX = 0f
         residualY = 0f
+        scrollResidual = 0f
     }
 }
+
