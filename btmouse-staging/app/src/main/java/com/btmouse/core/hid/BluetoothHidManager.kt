@@ -6,7 +6,11 @@ import android.bluetooth.BluetoothHidDevice
 import android.bluetooth.BluetoothHidDeviceAppQosSettings
 import android.bluetooth.BluetoothHidDeviceAppSdpSettings
 import android.bluetooth.BluetoothProfile
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
 import android.util.Log
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -184,7 +188,12 @@ class BluetoothHidManager private constructor(context: Context) {
                 Log.i(TAG, "HID Profile 已就绪")
                 listener?.onProfileReady(true)
                 // Profile 就绪后自动尝试注册（描述符）。注册成功即可被电脑发现/连接。
-                registerAsHidDevice()
+                // 注意：Android 12+ 缺少 BLUETOOTH_CONNECT 时 registerApp 会抛 SecurityException，必须等授权后再注册。
+                if (canRegisterHid()) {
+                    registerAsHidDevice()
+                } else {
+                    Log.w(TAG, "缺少蓝牙权限，暂不注册 HID；授权后请调用 registerAsHidDevice()")
+                }
             }
         }
 
@@ -208,6 +217,14 @@ class BluetoothHidManager private constructor(context: Context) {
      *  3. HID Report Descriptor：上面定义的标准鼠标描述符。
      */
     fun registerAsHidDevice() {
+        // Android 12+ (API 31+) 需要运行时权限 BLUETOOTH_CONNECT。
+        // 未授权时调用 registerApp 会抛 SecurityException；若发生在 Binder 回调线程上，
+        // 未捕获异常会直接导致进程崩溃（表现为"一打开就闪退"）。这里提前拦截。
+        if (!canRegisterHid()) {
+            Log.w(TAG, "缺少 BLUETOOTH_CONNECT 权限，跳过 HID 注册")
+            return
+        }
+
         val device = hidDevice ?: return
 
         val sdp = BluetoothHidDeviceAppSdpSettings(
@@ -231,7 +248,14 @@ class BluetoothHidManager private constructor(context: Context) {
         )
 
         // 异步注册，结果通过 hidCallback.onAppStatusChanged 回调
-        device.registerApp(sdp, qos, qos, executor, hidCallback)
+        try {
+            device.registerApp(sdp, qos, qos, executor, hidCallback)
+        } catch (e: SecurityException) {
+            // 权限在调用瞬间被撤销等竞态情况：记录而不是让进程崩溃
+            Log.e(TAG, "registerApp 权限不足", e)
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "registerApp 失败", e)
+        }
     }
 
     /**
@@ -328,4 +352,17 @@ class BluetoothHidManager private constructor(context: Context) {
         instance = null
         executor.shutdown()
     }
+
+    /**
+     * 当前是否具备注册 HID 所需的运行时权限。
+     *
+     * Android 12 (API 31) 起 BLUETOOTH_CONNECT 为运行时权限，必须由用户授予；
+     * Android 11 及以下不需要（manifest 中已是普通权限）。
+     */
+    fun canRegisterHid(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        return ContextCompat.checkSelfPermission(appContext, Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+    }
 }
+
