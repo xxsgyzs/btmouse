@@ -11,39 +11,49 @@ import android.os.Process
 import android.util.Log
 import com.btmouse.core.state.HidMode
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.sqrt
 
 /**
  * SensorMouseController —— 体感鼠标控制器（模式二「桌面平移」/ 模式三「空中遥控」）
  *
- * ██ 算法总览 ██
+ * ██ BATCH-3.5 重大变更：模式二从「加速度计积分」改为「陀螺仪」██
  *
- * 【模式二 · 桌面平移】把手机平放桌面推拉，用**线性加速度**积分出位移。
- *   加速度二次积分天生会漂移，因此这里用了四道防线：
- *     1. **低通滤波**：滤掉传感器高频噪声，避免噪声被积分放大成光标抖动
- *     2. **死区**：微小加速度视为 0，配合"静止判定"抑制零偏
- *     3. **速度阻尼泄漏**：每帧对速度乘一个略小于 1 的系数。物理上不严谨，
- *        但工程上非常有效——它把"积分漂移"变成"缓慢衰减"，光标不会一直跑飞
- *     4. **ZUPT 静止零速校正**：连续若干帧加速度都在死区内 → 判定静止，强制速度归零。
- *        这是手机 IMU 上抑制漂移最实用的手段（行人航位推算里的标准做法）
+ * 上一版用线性加速度二次积分求位移，真机实测**完全不可用**（漂移严重、几乎推不动），
+ * 原因不是参数没调好，而是方案本身的物理缺陷：
+ *   · 传感器零偏哪怕只有 0.01 m/s²，二次积分后位移随时间**平方增长**，必然跑飞；
+ *   · 单纯推拉手机产生的是很短促的加速度脉冲，积分出的位移远小于直觉预期；
+ *   · 要压住漂移就得大幅阻尼，而阻尼一大又"推不动"——这是个死结。
  *
- * 【模式三 · 空中遥控】手持悬空转动手腕，用**陀螺仪角速度**直接映射成光标速度。
- *   角度本身就是位移的导数，所以**不需要积分**，天然不漂移：
- *     角速度 → 低通滤波 → 死区 → 乘以角速度→像素系数 → 像素/秒
+ * 新方案：**用陀螺仪的角速度直接映射为光标速度**。
+ *   角速度本身就是"位移的导数"，只做一次映射、**不做任何积分**，因此天然不漂移。
+ *   操作直觉也成立：转动手机 → 光标移动；停止转动 → 光标立即停；摆正手机 → 自动停止。
  *
- * ██ 为什么不用卡尔曼滤波 ██
- *   卡尔曼在手机 IMU + 单人使用场景下收益极低，却带来两个实际问题：
- *   参数（过程噪声 Q / 观测噪声 R）几乎无法直观整定，且状态维度高、调参全靠试。
- *   低通 + 死区 + ZUPT + 阻尼的组合**参数含义明确、可解释、可现场手调**，
- *   对"让用户觉得跟手"这个目标更实用。
+ * ██ 为什么"转手机"等价于"推鼠标"██
+ *   本模式面向"手机平放桌面"的使用方式：手掌压在手机上做小幅转动，
+ *   屏幕上的光标就朝着转动方向滑动；手一停光标就停，不需要回中。
+ *   —— 这与上一版"推拉手机求位移"的交互目标一致，但数学上是稳定的。
+ *
+ * ██ 算法管线 ██
+ *   陀螺仪 ω(rad/s)
+ *     → 1. 一阶低通（滤高频噪声，避免光标细碎抖动）
+ *     → 2. 死区（|ω| < DEAD_ZONE_RAD_S 视为 0，抑制手抖与陀螺零偏）
+ *     → 3. 标定映射（rad/s → 像素/秒）
+ *     → 4. 姿态闸门（加速度计 + 互补滤波估计倾角；接近水平则强制归零 → "摆正自动停止"）
+ *     → 5. 亚像素累积后按 8ms 节流派发
+ *
+ * ██ 互补滤波在这里的作用 ██
+ *   陀螺仪动态准但会漂移，加速度计静态准但噪声大。互补滤波把两者按权重融合：
+ *     angle = (1-w)·(angle + ω·dt) + w·accelAngle
+ *   本类用它估计手机的 roll/pitch，作为"是否已摆正"的判据。
+ *   （注意：它**只用于姿态闸门**，光标速度本身不经过积分，所以不存在积分漂移。）
  *
  * ██ 线程模型 ██
- *   传感器回调（通常主线程）只做滤波与状态更新，然后 post 到内部 HandlerThread，
- *   由该线程按 EMIT_INTERVAL_MS 节流派发。回调 onCursorDelta 因此在后台线程触发，
- *   而下游（SendQueue）本身就是线程安全的入口。
+ *   传感器回调直接运行在内部 HandlerThread（registerListener 的第 4 个参数），
+ *   滤波与派发都在同一线程完成，无需额外 post；下游 SendQueue 本身线程安全。
  *
  * @param context 任意 Context（内部取 applicationContext）
- * @param onCursorDelta 光标位移回调 (dxPx, dyPx)，在内部后台线程调用
+ * @param onCursorDelta 光标位移回调 (dxPx, dyPx)
  * @param onScrollDelta 滚轮回调 (dyPx)，屏幕坐标（向下为正）
  */
 class SensorMouseController(
@@ -60,7 +70,7 @@ class SensorMouseController(
         .apply { start() }
     private val handler = Handler(thread.looper)
 
-    // ---------------- 状态（sensor 线程写、handler 线程读，故用 @Volatile） ----------------
+    // ---------------- 运行状态 ----------------
 
     @Volatile
     private var mode: HidMode? = null
@@ -68,292 +78,236 @@ class SensorMouseController(
     @Volatile
     private var active = false
 
-    // ---------------- 静止判定（ZUPT） ----------------
+    private var registeredMode: HidMode? = null
 
-    /** 连续处于死区内的帧数；超过阈值即判定静止并强制速度归零。 */
-    private var stillFrames = 0
-    private var still = true
+    // ---------------- 陀螺仪低通状态 ----------------
 
-    // ---------------- 低通滤波状态 ----------------
-
-    private var gravityX = 0f
-    private var gravityY = 0f
-    private var gravityZ = 0f
-
-    /** 模式二的线性加速度滤波值（m/s²）。 */
-    private var linX = 0f
-    private var linY = 0f
-
-    /** 模式三的角速度滤波值（rad/s）。 */
     private var gyroX = 0f
     private var gyroY = 0f
 
-    // ---------------- 积分状态（仅 handler 线程访问） ----------------
+    // ---------------- 互补滤波 / 姿态估计状态 ----------------
 
-    private var velX = 0f
-    private var velY = 0f
+    /** 估计的 roll（绕 Y 轴，右倾为正）与 pitch（绕 X 轴，前倾为正），单位弧度。 */
+    private var rollRad = 0f
+    private var pitchRad = 0f
 
-    /** 待派发的像素累积（handler 线程）。 */
+    /** 上一帧时间戳（纳秒），用于互补滤波的积分项。 */
+    private var lastFrameNs = 0L
+
+    /** 加速度计是否可用（决定姿态闸门是否生效）。 */
+    private var hasAccel = false
+
+    /** 是否已用加速度计初始化过一次姿态角（避免启动瞬间基准为 0 导致闸门误判）。 */
+    private var poseSeeded = false
+
+    // ---------------- 派发状态 ----------------
+
     private var accPxX = 0f
     private var accPxY = 0f
-
     private var lastEmitNs = 0L
-    private var lastStillEventNs = 0L
 
-    private var registeredMode: HidMode? = null
-
-    /** 传感器是否可用（如设备无陀螺仪时，模式三会降级）。 */
-    fun isAvailable(target: HidMode): Boolean = resolveSensor(target) != null
-
-    private fun resolveSensor(target: HidMode): Int? {
-        val sm = sensorManager ?: return null
-        return when (target) {
-            HidMode.DESK ->
-                if (sm.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION) != null) {
-                    Sensor.TYPE_LINEAR_ACCELERATION
-                } else {
-                    // 少数设备没有 LINEAR_ACCELERATION，退回原始加速度计（用重力低通自己减）
-                    if (sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) != null) {
-                        Sensor.TYPE_ACCELEROMETER
-                    } else {
-                        null
-                    }
-                }
-
-            HidMode.AIR ->
-                if (sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null) {
-                    Sensor.TYPE_GYROSCOPE
-                } else {
-                    null
-                }
-
-            HidMode.TRACKPAD -> null
-        }
+    /**
+     * 传感器是否可用（无陀螺仪的设备无法使用体感模式）。
+     */
+    fun isAvailable(target: HidMode): Boolean = when (target) {
+        HidMode.DESK, HidMode.AIR -> sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE) != null
+        HidMode.TRACKPAD -> false
     }
 
     /**
      * 启动指定模式。重复调用会先停止上一个模式。
      * TRACKPAD 模式下等价于 [stop]。
+     *
+     * 模式二与模式三共用同一套测速管线（都基于陀螺仪），只是**标定系数不同**：
+     * 模式三手持悬空，转动幅度大，用较小的系数；模式二平放桌面，转动幅度小，用较大的系数。
      */
     fun start(target: HidMode) {
         if (target == HidMode.TRACKPAD) {
             stop()
             return
         }
-        val sm = sensorManager
-        val type = resolveSensor(target)
-        if (sm == null || type == null) {
-            Log.w(TAG, "模式 $target 所需传感器不可用，无法启动")
+        val sm = sensorManager ?: return
+        val gyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        if (gyro == null) {
+            Log.w(TAG, "本机没有陀螺仪，无法使用模式 $target")
             return
         }
         if (active && registeredMode == target) return
 
         stop()
 
-        val sensor = sm.getDefaultSensor(type) ?: return
-        val rate = when (target) {
-            HidMode.DESK -> SensorManager.SENSOR_DELAY_GAME
-            else -> SensorManager.SENSOR_DELAY_GAME
+        // 陀螺仪是必需的；加速度计用于姿态闸门，缺失时降级（闸门不生效，仅靠死区）
+        val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        hasAccel = accel != null
+
+        val gyroOk = sm.registerListener(this, gyro, SensorManager.SENSOR_DELAY_GAME, handler)
+        var accelOk = true
+        if (accel != null) {
+            accelOk = sm.registerListener(this, accel, SensorManager.SENSOR_DELAY_GAME, handler)
         }
-        val ok = sm.registerListener(this, sensor, rate, handler)
-        if (!ok) {
-            Log.e(TAG, "registerListener 失败: $target")
+
+        if (!gyroOk) {
+            Log.e(TAG, "registerListener(gyro) 失败: $target")
             return
+        }
+        if (!accelOk) {
+            hasAccel = false
+            Log.w(TAG, "registerListener(accel) 失败，姿态闸门关闭")
         }
 
         resetState()
         registeredMode = target
         mode = target
         active = true
-        Log.i(TAG, "传感器已启动: $target (sensorType=$type)")
+        Log.i(TAG, "陀螺仪已启动: $target (accel=$hasAccel)")
     }
 
-    /** 停止并注销传感器；会清空积分状态避免下次启动时残留速度。 */
+    /** 停止并注销传感器；清空累积避免下次启动残留。 */
     fun stop() {
         sensorManager?.unregisterListener(this)
         active = false
         registeredMode = null
         mode = null
-        handler.post { resetIntegration() }
+        accPxX = 0f
+        accPxY = 0f
+        lastEmitNs = 0L
     }
 
-    /** 释放线程资源（前台服务销毁时调用）。 */
+    /** 释放线程资源。 */
     fun release() {
         stop()
         thread.quitSafely()
     }
 
     private fun resetState() {
-        stillFrames = 0
-        still = true
-        gravityX = 0f; gravityY = 0f; gravityZ = 0f
-        linX = 0f; linY = 0f
-        gyroX = 0f; gyroY = 0f
-        lastStillEventNs = 0L
-        handler.post { resetIntegration() }
-    }
-
-    private fun resetIntegration() {
-        velX = 0f; velY = 0f
-        accPxX = 0f; accPxY = 0f
+        gyroX = 0f
+        gyroY = 0f
+        rollRad = 0f
+        pitchRad = 0f
+        lastFrameNs = 0L
+        poseSeeded = false
+        accPxX = 0f
+        accPxY = 0f
         lastEmitNs = 0L
     }
 
-    // ---------------- 传感器回调 ----------------
+    // ---------------- 传感器回调（运行在内部 HandlerThread） ----------------
 
     override fun onSensorChanged(event: SensorEvent) {
         if (!active) return
-        val dt = frameSeconds(event.timestamp)
+
+        val now = event.timestamp
+        val dt = frameSeconds(now)
+
         when (event.sensor.type) {
-            Sensor.TYPE_LINEAR_ACCELERATION ->
-                updateDesk(event.values[0], event.values[1], event.values[2], dt)
+            Sensor.TYPE_GYROSCOPE -> {
+                val tuning = TUNING
 
-            Sensor.TYPE_ACCELEROMETER ->
-                updateDeskFromRaw(event.values[0], event.values[1], event.values[2], dt)
+                // 1) 低通滤波
+                gyroX = lowPass(gyroX, event.values[0], tuning.gyroAlpha)
+                gyroY = lowPass(gyroY, event.values[1], tuning.gyroAlpha)
 
-            Sensor.TYPE_GYROSCOPE ->
-                updateAir(event.values[0], event.values[1], dt)
+                // 2) 死区：抑制手抖与陀螺零偏
+                val wx = applyDeadZone(gyroX, tuning.deadZoneRadS)
+                val wy = applyDeadZone(gyroY, tuning.deadZoneRadS)
+
+                // 3) 陀螺积分推进姿态角（互补滤波的"预测"步）
+                rollRad += wy * dt
+                pitchRad += wx * dt
+
+                // 4) 姿态闸门：手机接近水平时强制停止（"摆正自动停止"）
+                if (hasAccel && isLevel()) {
+                    gyroX = 0f
+                    gyroY = 0f
+                    return
+                }
+
+                // 5) 映射为像素（角速度 → 像素/秒），累加到当前节拍
+                val pixelsPerRad = pixelsPerRadPerSecond()
+                accPxX += wy * pixelsPerRad * dt
+                accPxY += wx * pixelsPerRad * dt
+
+                emitIfDue(now)
+            }
+
+            Sensor.TYPE_ACCELEROMETER -> {
+                if (!hasAccel) return
+                val tuning = TUNING
+                val ax = event.values[0]
+                val ay = event.values[1]
+                val az = event.values[2]
+
+                // 由重力方向估算静态倾角（手机水平、屏幕朝上时为 0）
+                val accelRoll = atan2(ay, az)
+                val accelPitch = atan2(-ax, sqrt(ay * ay + az * az))
+
+                // 互补滤波的"校正"步：动态用陀螺、静态用加速度计
+                if (!poseSeeded) {
+                    // 首个加速度计样本：直接采纳静态倾角作为基准。
+                    // 否则姿态角会从 0 缓慢收敛，若用户一开始就斜着拿手机，
+                    // "摆正自动停止"闸门会在头一两秒内误判为水平而锁死光标。
+                    rollRad = accelRoll
+                    pitchRad = accelPitch
+                    poseSeeded = true
+                }
+
+                val w = tuning.accelTrust
+                if (w > 0f) {
+                    rollRad = (1f - w) * rollRad + w * accelRoll
+                    pitchRad = (1f - w) * pitchRad + w * accelPitch
+                }
+            }
 
             else -> return
         }
-        handler.post { emitIfDue() }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit // 不使用精度事件
 
-    /** 相邻两次事件的间隔（秒），钳制到合理区间以抵御丢帧/时间戳跳变。 */
+    /** 相邻两次事件间隔（秒），钳制以防丢帧/时间戳跳变。 */
     private fun frameSeconds(eventNs: Long): Float {
-        if (lastStillEventNs == 0L) {
-            lastStillEventNs = eventNs
+        if (lastFrameNs == 0L) {
+            lastFrameNs = eventNs
             return MAX_DT_S
         }
-        val dt = (eventNs - lastStillEventNs) / 1_000_000_000f
-        lastStillEventNs = eventNs
+        val dt = (eventNs - lastFrameNs) / 1_000_000_000f
+        lastFrameNs = eventNs
         return dt.coerceIn(MIN_DT_S, MAX_DT_S)
     }
 
-    // ---------------- 模式二：桌面平移 ----------------
-
     /**
-     * @param ax,ay,az 线性加速度（已去重力，单位 m/s²）
-     */
-    private fun updateDesk(ax: Float, ay: Float, az: Float, dt: Float) {
-        linX = lowPass(linX, ax, TUNING.motionAlpha)
-        linY = lowPass(linY, ay, TUNING.motionAlpha)
-        integrateMotion(linX, linY, az, dt)
-    }
-
-    /**
-     * 没有 TYPE_LINEAR_ACCELERATION 时的退化路径：
-     * 用低通提取重力分量，再用原始值减去它得到线性加速度。
-     */
-    private fun updateDeskFromRaw(ax: Float, ay: Float, az: Float, dt: Float) {
-        gravityX = lowPass(gravityX, ax, TUNING.gravityAlpha)
-        gravityY = lowPass(gravityY, ay, TUNING.gravityAlpha)
-        gravityZ = lowPass(gravityZ, az, TUNING.gravityAlpha)
-
-        val lx = ax - gravityX
-        val ly = ay - gravityY
-        val lz = az - gravityZ
-
-        linX = lowPass(linX, lx, TUNING.motionAlpha)
-        linY = lowPass(linY, ly, TUNING.motionAlpha)
-
-        integrateMotion(linX, linY, lz, dt)
-    }
-
-    /**
-     * 把线性加速度积分成速度（并在 handler 线程里进一步积分成像素，见 [emitIfDue]）。
-     */
-    private fun integrateMotion(ax: Float, ay: Float, az: Float, dt: Float) {
-        val magnitude = sqrt(ax * ax + ay * ay + az * az)
-
-        // ZUPT：连续多帧都在死区内 → 判定静止
-        if (magnitude < TUNING.deadZoneMs2) {
-            stillFrames++
-            if (stillFrames >= TUNING.stillFramesForZupt) still = true
-        } else {
-            stillFrames = 0
-            still = false
-        }
-
-        handler.post {
-            if (still) {
-                velX = 0f
-                velY = 0f
-                return@post
-            }
-            // v += a * dt
-            velX += ax * dt
-            velY += ay * dt
-            // 阻尼泄漏：把积分漂移变成缓慢衰减，光标不会一直跑飞
-            val damp = TUNING.velocityDamp
-            velX *= damp
-            velY *= damp
-            // 速度死区：极小的残余速度直接归零，避免"缓慢蠕动"
-            if (abs(velX) < TUNING.velocityDeadZoneMs) velX = 0f
-            if (abs(velY) < TUNING.velocityDeadZoneMs) velY = 0f
-        }
-    }
-
-    // ---------------- 模式三：空中遥控 ----------------
-
-    /**
-     * @param wx,wz 陀螺仪角速度（rad/s）：wx 绕 X 轴、wz 绕 Z 轴
-     */
-    private fun updateAir(wx: Float, wz: Float, dt: Float) {
-        @Suppress("UNUSED_VARIABLE")
-        val unusedDt = dt // 角速度直接映射为像素速度，无需积分，故不使用 dt
-
-        gyroX = lowPass(gyroX, wx, TUNING.gyroAlpha)
-        gyroY = lowPass(gyroY, wz, TUNING.gyroAlpha)
-    }
-
-    // ---------------- 节流派发（handler 线程） ----------------
-
-    /**
-     * 按 EMIT_INTERVAL_MS 节流，把累积的物理量换算为像素后一次性派发。
+     * 是否已"摆正"：roll 与 pitch 都接近水平。
      *
-     * 模式二在此处做"速度→像素"的积分；模式三直接用角速度算像素速度。
+     * 这是**摆正自动停止**逻辑：把手机转回水平姿态后，
+     * 即使陀螺仍有微小残余输出，也会被彻底归零，光标不会缓慢蠕动。
      */
-    private fun emitIfDue() {
-        if (!active) return
-        val current = mode ?: return
-
-        val now = System.nanoTime()
-        if (lastEmitNs != 0L) {
-            val elapsedNs = now - lastEmitNs
-            if (elapsedNs < EMIT_INTERVAL_MS * 1_000_000L) return
-        }
-        val seconds = if (lastEmitNs == 0L) {
-            EMIT_INTERVAL_MS / 1000f
-        } else {
-            ((now - lastEmitNs) / 1_000_000_000f).coerceIn(MIN_DT_S, 0.1f)
-        }
-        lastEmitNs = now
-
-        when (current) {
-            HidMode.DESK -> {
-                // 速度(m/s) → 像素：先按 m/s²→像素的标定比例换算，再乘积分时间
-                accPxX += velX * TUNING.deskAccelScale * seconds
-                accPxY += velY * TUNING.deskAccelScale * seconds
-                flushCursor()
-            }
-
-            HidMode.AIR -> {
-                // 角速度(rad/s) → 像素/秒，无需积分
-                accPxX += gyroY * TUNING.airGyroScale * seconds
-                accPxY += gyroX * TUNING.airGyroScale * seconds
-                flushCursor()
-            }
-
-            HidMode.TRACKPAD -> Unit
-        }
+    private fun isLevel(): Boolean {
+        val limit = TUNING.levelAngleRad
+        return abs(rollRad) < limit && abs(pitchRad) < limit
     }
 
-    /** 把累积像素取整派发，余量留到下一帧。 */
-    private fun flushCursor() {
+    /**
+     * 角速度 → 像素/秒 的标定系数。
+     *
+     * 模式三手持悬空转动幅度大 → 系数小一些；
+     * 模式二平放桌面只能小幅转动 → 系数大一些，否则"转半天不动"。
+     */
+    private fun pixelsPerRadPerSecond(): Float = when (mode) {
+        HidMode.DESK -> TUNING.deskGyroScale
+        HidMode.AIR -> TUNING.airGyroScale
+        else -> 0f
+    }
+
+    /** 按节流派发累积像素；小于阈值的余量留到下一帧。 */
+    private fun emitIfDue(nowNs: Long) {
+        if (lastEmitNs != 0L) {
+            val elapsed = nowNs - lastEmitNs
+            if (elapsed < EMIT_INTERVAL_NS) return
+        }
+        lastEmitNs = nowNs
+
         if (abs(accPxX) < MIN_PIXEL_TO_EMIT && abs(accPxY) < MIN_PIXEL_TO_EMIT) return
+
         onCursorDelta(accPxX, accPxY)
         accPxX = 0f
         accPxY = 0f
@@ -361,58 +315,60 @@ class SensorMouseController(
 
     /**
      * 由 UI 的滚轮条调用：把竖向滑动像素交给上层换算成滚轮格数。
-     * 传感器线程安全（直接转发，由上层做残差累积）。
+     * 直接转发，由上层（TouchInputHandler）做残差累积与参数统一。
      */
     fun scrollBy(dyPx: Float) {
         if (dyPx != 0f) onScrollDelta(dyPx)
     }
 
-    /** 一阶低通滤波：y[n] = a*x[n] + (1-a)*y[n-1]，a 越大越"跟手"、越小越平滑。 */
+    /** 一阶低通：y[n] = a·x[n] + (1-a)·y[n-1]。a 越大越跟手，越小越平滑。 */
     private fun lowPass(prev: Float, input: Float, alpha: Float): Float {
         val a = alpha.coerceIn(0f, 1f)
         return prev + a * (input - prev)
     }
 
-    // ---------------- 可现场整定的参数 ----------------
+    /** 死区：模长小于阈值的角速度直接归零。 */
+    private fun applyDeadZone(value: Float, zone: Float): Float =
+        if (abs(value) < zone) 0f else value
+
+    // ---------------- 真机整定参数 ----------------
 
     /**
-     * 体感算法整定参数。
+     * 体感算法整定参数（集中在此便于真机微调）。
      *
-     * 这些值决定"手感"，必须真机试出来，因此集中放在一处便于修改：
-     *  - 觉得光标太"飘"/抖 → 调小 motionAlpha、gyroAlpha（更强的低通）
-     *  - 觉得跟手不够、迟滞 → 调大 motionAlpha、gyroAlpha
-     *  - 静止时仍缓慢跑动 → 调大 deadZoneMs2 或 stillFramesForZupt，或调小 velocityDamp
-     *  - 移动幅度太小/太大 → 调 deskAccelScale / airGyroScale
+     * 调参速查：
+     *  · 光标太飘/抖        → 调小 [gyroAlpha]（更强的低通）
+     *  · 跟手不够、迟滞      → 调大 [gyroAlpha]
+     *  · 静止时仍在缓慢移动   → 调大 [deadZoneRadS]，或调大 [levelAngleRad]
+     *  · 转很久才动一点      → 调大 [deskGyroScale]
+     *  · 一动就飞出去        → 调小 [deskGyroScale]
+     *  · 摆正后不停止        → 调大 [levelAngleRad]（放宽"水平"的判定）
+     *  · 姿态闸门误触发      → 调小 [levelAngleRad]，或把 [accelTrust] 设为 0 关闭闸门
      */
     data class Tuning(
-        /** 线性加速度低通系数（0..1）。 */
-        val motionAlpha: Float = 0.45f,
         /** 陀螺仪低通系数（0..1）。 */
-        val gyroAlpha: Float = 0.35f,
-        /** 重力估计低通系数（仅退化路径使用）。 */
-        val gravityAlpha: Float = 0.08f,
-        /** 桌面模式死区（m/s²）：合加速度模长小于此值视为"没在动"。 */
-        val deadZoneMs2: Float = 0.06f,
-        /** 连续多少帧处于死区即判定静止（ZUPT），按 100Hz 采样约 0.12s。 */
-        val stillFramesForZupt: Int = 12,
-        /** 速度阻尼泄漏系数（每帧），略微小于 1。 */
-        val velocityDamp: Float = 0.93f,
-        /** 速度死区（m/s）：小于此值直接归零，消除缓慢蠕动。 */
-        val velocityDeadZoneMs: Float = 0.012f,
-        /** 桌面模式标定：1 m/s 的速度对应多少像素/秒。 */
-        val deskAccelScale: Float = 50f,
-        /** 空中模式标定：1 rad/s 的角速度对应多少像素/秒。 */
-        val airGyroScale: Float = 18f
+        val gyroAlpha: Float = 0.30f,
+        /** 陀螺死区（rad/s）。0.05 rad/s ≈ 2.9°/s，可压住手抖与常见零偏。 */
+        val deadZoneRadS: Float = 0.05f,
+        /** 姿态闸门角度（rad）。0.10 rad ≈ 5.7°，手机接近水平即强制停止。 */
+        val levelAngleRad: Float = 0.10f,
+        /** 互补滤波中加速度计的权重（0..1）。0 表示关闭姿态闸门。 */
+        val accelTrust: Float = 0.02f,
+        /** 模式二（平放桌面）标定：1 rad/s 对应多少像素/秒。 */
+        val deskGyroScale: Float = 500f,
+        /** 模式三（手持悬空）标定：1 rad/s 对应多少像素/秒。 */
+        val airGyroScale: Float = 260f
     )
 
     companion object {
         private const val TAG = "SensorMouseController"
 
-        /** 派发节流：约 125Hz，与触控通路的节奏一致。 */
+        /** 派发节流：约 125Hz，与触控通路一致。 */
         private const val EMIT_INTERVAL_MS = 8L
+        private const val EMIT_INTERVAL_NS = EMIT_INTERVAL_MS * 1_000_000L
 
-        /** 小于 1px 的累积不派发，留到下一帧，避免高频空转。 */
-        private const val MIN_PIXEL_TO_EMIT = 0.6f
+        /** 小于该像素量不派发，余量留到下一帧（亚像素累积）。 */
+        private const val MIN_PIXEL_TO_EMIT = 0.5f
 
         private const val MIN_DT_S = 0.001f
         private const val MAX_DT_S = 0.05f
