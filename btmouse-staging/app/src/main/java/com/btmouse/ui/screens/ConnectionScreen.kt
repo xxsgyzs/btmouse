@@ -33,12 +33,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.graphics.vector.PathBuilder
-import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -273,26 +267,3 @@ private fun DeviceCard(
     }
 }
 
-// ---------------- 内置矢量图标 ----------------
-
-private fun connectionIcon(name: String, block: PathBuilder.() -> Unit): ImageVector =
-    ImageVector.Builder(
-        name = name,
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f
-    ).apply {
-        path(
-            fill = SolidColor(Color.Transparent),
-            stroke = SolidColor(Color.White),
-            strokeLineWidth = 2f,
-            strokeLineCap = StrokeCap.Round,
-            pathBuilder = block
-        )
-    }.build()
-
-private val BackArrowIcon: ImageVector = connectionIcon("BackArrow") {
-    moveTo(19f, 12f); lineTo(5f, 12f)
-    moveTo(11f, 6f); lineTo(5f, 12f); lineTo(11f, 18f)
-}
