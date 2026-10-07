@@ -34,8 +34,13 @@ import com.btmouse.ui.theme.BtMouseTheme
  * 导航结构（三级）：
  *   模式选择（首页） → 连接页 → 控制页（按所选模式渲染不同布局）
  *
- * 采用自实现的轻量导航（[AppScreen] + [AnimatedContent]），不引入 navigation-compose 依赖：
+ * 采用自实现的轻量导航（AppScreen + AnimatedContent），不引入 navigation-compose 依赖：
  * 本应用只有三个页面、无深链接需求，自实现更省体积也更好控制过渡动画。
+ *
+ * ██ BATCH-5.1 结论：本文件无需修改 ██
+ *  `ControlScreen` 的返回箭头通过 `onExit = { screen = AppScreen.CONNECT }` 直接绑定，
+ *  链路正确。此前"箭头点不动"的原因是 ControlScreen 内手势区过早消费事件，
+ *  已在 TrackpadScreen 中修复（改为 PointerEventPass.Final + 仅拖动后消费）。
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
