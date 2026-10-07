@@ -19,7 +19,9 @@ import com.btmouse.core.state.ModeStore
 import com.btmouse.core.state.MouseSettings
 import com.btmouse.core.state.SettingsStore
 import com.btmouse.service.HidForegroundService
+import com.btmouse.util.PermissionHelper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -28,21 +30,21 @@ import kotlinx.coroutines.launch
  * 统一持有 BluetoothHidManager 单例、TouchInputHandler（像素→逻辑位移）与
  * SensorMouseController（体感位移），向 Compose 暴露：模式选择、连接状态、配对列表、手感参数。
  *
- * 数据流（两条入口，汇入同一条 HID 通路）：
- *   触控/按键 → TouchInputHandler(死区+自适应EMA+残差累积) ─┐
- *   传感器    → SensorMouseController(低通+死区+ZUPT+阻尼) ─┤
- *                                                          └→ manager.submitMouseInput/submitWheel
- *                                                             → SendQueue(节拍+拆帧) → sendReport
- *
- * 模式说明：
- *   - [HidMode.TRACKPAD]：触摸直接产生位移（含双指滚轮）
- *   - [HidMode.DESK]：加速度计积分位移（桌面平放推拉）
- *   - [HidMode.AIR]：陀螺仪角速度映射（手持悬空转动）
+ * ██ BATCH-5.1 修复 ██
+ *  1. **权限判定改用 PermissionHelper.hasRequiredBluetooth**：
+ *     通知权限被拒不再阻断 HID 注册（原实现会因此永远注册不上）。
+ *  2. **Profile 就绪后自动补注册**：若首次 registerApp 发生在 hidDevice 尚未就绪时
+ *     （BluetoothHidManager.registerAsHidDevice 会静默 return），这里会在
+ *     onProfileReady(true) 时自动重试一次，覆盖该失败路径。
+ *  3. **连接过程可视化**：isConnecting / connectMessage 让"点了没反应"变成有反馈。
  */
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
         private const val TAG = "MainViewModel"
+
+        /** 主动连接后的等待上限：超时即认为主机没有响应。 */
+        private const val CONNECT_TIMEOUT_MS = 6000L
     }
 
     private val manager: BluetoothHidManager
@@ -64,8 +66,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 触控位移处理器：把像素增量转成滤波后的逻辑位移，并透传当前按钮状态到发送队列。
      * buttons 采用位掩码（可用 | 组合），按下/抬起即时提交。
-     *
-     * wheel 参数在 BATCH-3 接入，用于双指滑动滚轮。
      */
     private val touchHandler = TouchInputHandler(
         submit = { dx, dy, buttons, wheel ->
@@ -89,7 +89,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var profileReady by mutableStateOf(false)
         private set
 
-    /** 本设备是否已注册为 HID 鼠标 */
+    /** 本设备是否已成功注册为 HID 鼠标 */
     var appRegistered by mutableStateOf(false)
         private set
 
@@ -105,18 +105,40 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var sensorAvailable by mutableStateOf(true)
         private set
 
+    /** 是否正在等待主机响应（点击设备后置位，连接成功或超时后复位）。 */
+    var isConnecting by mutableStateOf(false)
+        private set
+
+    /** 面向用户的一句话状态提示（连接超时 / 未注册等），null 表示无提示。 */
+    var connectMessage by mutableStateOf<String?>(null)
+        private set
+
+    /** 蓝牙必需权限是否已授予。 */
+    var bluetoothPermissionGranted by mutableStateOf(false)
+        private set
+
     init {
         // 把持久化的手感立即应用到处理器（含灵敏度 / 平滑下限 / 滚轮参数）
         applySettingsToHandler()
 
-        // 订阅蓝牙状态（回调在 HID 线程，需切回主线程更新 UI）
+        // 订阅蓝牙状态（回调可能在 Binder/HID 线程，统一切回主线程更新 UI）
         manager.listener = object : BluetoothHidManager.HidStateListener {
             override fun onProfileReady(ready: Boolean) {
-                viewModelScope.launch(Dispatchers.Main) { profileReady = ready }
+                viewModelScope.launch(Dispatchers.Main) {
+                    profileReady = ready
+                    if (ready) {
+                        // 关键补注册：首次 registerApp 可能因 hidDevice 尚未就绪而静默失败，
+                        // 此刻 Profile 已确认就绪，重试一次即可覆盖该路径（registerApp 幂等）。
+                        manager.registerAsHidDevice()
+                    }
+                }
             }
 
             override fun onAppRegistered(registered: Boolean) {
-                viewModelScope.launch(Dispatchers.Main) { appRegistered = registered }
+                viewModelScope.launch(Dispatchers.Main) {
+                    appRegistered = registered
+                    if (registered) connectMessage = null
+                }
             }
 
             override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
@@ -125,12 +147,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         BluetoothProfile.STATE_CONNECTED -> device
                         else -> null
                     }
+                    if (state == BluetoothProfile.STATE_CONNECTED) {
+                        isConnecting = false
+                        connectMessage = null
+                    }
                 }
             }
         }
-        // 先检查运行时权限：缺少 BLUETOOTH_CONNECT 时不能启动前台服务、也不能注册 HID，
-        // 否则在 Android 12+ 上会抛 SecurityException 导致"一打开就闪退"。
-        if (canUseBluetooth()) {
+
+        // 先检查运行时权限：缺少蓝牙权限时不能启动前台服务、也不能注册 HID，
+        // 否则 Android 12+ 会抛 SecurityException 导致闪退。
+        // 注意：这里**只看蓝牙必需权限**，通知权限被拒不影响蓝牙功能。
+        val granted = PermissionHelper.hasRequiredBluetooth(getApplication())
+        bluetoothPermissionGranted = granted
+        if (granted) {
             startBluetoothStack()
         } else {
             Log.w(TAG, "蓝牙权限未授予，等待用户在连接页授权后启动 HID")
@@ -158,8 +188,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         HidForegroundService.start(getApplication())
     }
 
-    /** 权限授予后调用：启动蓝牙链路，并在 HID 服务已就绪时补注册一次。 */
+    /**
+     * 权限授予后调用：启动蓝牙链路，并立即尝试补注册一次。
+     *
+     * 若此刻 Profile 尚未就绪，registerAsHidDevice 会静默 return ——
+     * 这种情况由 onProfileReady(true) 里的补注册兜住，不会漏。
+     */
     fun onBluetoothPermissionGranted() {
+        bluetoothPermissionGranted = PermissionHelper.hasRequiredBluetooth(getApplication())
+        startBluetoothStack()
+        manager.registerAsHidDevice()
+        refreshBonded()
+    }
+
+    /** 供 UI 手动重试：重新初始化并尝试注册。 */
+    fun retryRegister() {
+        connectMessage = null
         startBluetoothStack()
         manager.registerAsHidDevice()
     }
@@ -175,8 +219,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * 切换操作模式：更新状态 + 持久化 + 启停传感器 + 清空滤波残差。
-     *
-     * 清空残差是为了避免切换瞬间把上一模式累积的小数位移带进新模式。
      */
     fun selectMode(mode: HidMode) {
         if (mode == currentMode) return
@@ -204,17 +246,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------- 手感参数 ----------------
 
-    /** 灵敏度实时生效（设置页滑块拖动中即调用）。 */
     fun updateSensitivity(value: Float) {
         updateSettings(settings.copy(sensitivity = value.coerceIn(SettingsStore.SENSITIVITY_RANGE)))
     }
 
-    /** 平滑下限实时生效。 */
     fun updateSmoothing(value: Float) {
         updateSettings(settings.copy(smoothing = value.coerceIn(SettingsStore.SMOOTHING_RANGE)))
     }
 
-    /** 滚轮速度实时生效（每格所需像素）。 */
     fun updatePixelsPerScrollClick(value: Float) {
         updateSettings(
             settings.copy(
@@ -237,10 +276,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         applySettingsToHandler()
     }
 
-    /**
-     * 把参数注入两个处理器的公开属性。
-     * 它们每次运算都会读取这些属性，因此是**实时生效**的。
-     */
     private fun applySettingsToHandler() {
         touchHandler.sensitivity = settings.sensitivity
         touchHandler.smoothing = settings.smoothing
@@ -251,21 +286,61 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 刷新已配对设备列表（需已获得 BLUETOOTH_CONNECT 权限）。 */
     fun refreshBonded() {
+        if (!PermissionHelper.hasRequiredBluetooth(getApplication())) {
+            Log.w(TAG, "refreshBonded 跳过：缺少蓝牙权限")
+            return
+        }
         val list = adapter?.bondedDevices
-            ?.filter { it.type != BluetoothDevice.DEVICE_TYPE_LE } // 过滤纯 BLE，聚焦 HID 主机（多为经典蓝牙）
             ?.toList()
             .orEmpty()
         bondedDevices = list.sortedBy { it.name ?: it.address }
     }
 
-    /** 发起连接。 */
+    /**
+     * 请求与指定主机建立 HID 连接。
+     *
+     * 重要背景：**蓝牙 HID 设备无法主动连接主机**。
+     * BluetoothHidManager.connect 发出的只是一次"请求"，真正的连接由主机侧发起；
+     * 若主机未在蓝牙设置里选中本设备，这里不会有任何回调，看起来就像"点了没反应"。
+     * 因此本方法会置位 isConnecting 并在超时后给出明确提示。
+     */
     fun connect(device: BluetoothDevice) {
+        connectMessage = null
+
+        if (!appRegistered) {
+            if (!canUseBluetooth()) {
+                connectMessage = "缺少蓝牙权限，请先点击上方「授予蓝牙权限」"
+            } else {
+                connectMessage = "尚未注册为鼠标，正在重试…"
+                retryRegister()
+            }
+            return
+        }
+
         manager.connect(device)
+        isConnecting = true
+
+        // 超时兜底：主机未响应时给出可操作提示，而不是无限等待
+        viewModelScope.launch(Dispatchers.Main) {
+            delay(CONNECT_TIMEOUT_MS)
+            if (isConnecting && connectedDevice == null) {
+                isConnecting = false
+                connectMessage = "主机未响应。请到电脑的蓝牙设置中，选择「" +
+                    "鑫作蓝鼠」进行连接"
+            }
+        }
     }
 
     /** 断开当前连接。 */
     fun disconnect() {
         manager.getConnectedDevice()?.let { manager.disconnect(it) }
+        isConnecting = false
+        connectMessage = null
+    }
+
+    /** 清除提示（如用户已阅读）。 */
+    fun clearConnectMessage() {
+        connectMessage = null
     }
 
     // ---------------- 输入上报 ----------------
@@ -280,27 +355,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         touchHandler.buttons = applyButton(MouseReportBuilder.BUTTON_RIGHT, pressed)
     }
 
-    /**
-     * 提交移动增量（dx/dy 为像素位移），由 TouchInputHandler 滤波后发送。
-     * 供模式一（触控板）使用。
-     */
+    /** 提交移动增量（dx/dy 为像素位移），供模式一（触控板）使用。 */
     fun submitMove(dxPx: Float, dyPx: Float) {
         touchHandler.onDrag(dxPx, dyPx)
     }
 
-    /**
-     * 提交双指滚动（像素位移），由 TouchInputHandler 换算成滚轮格数。
-     * 供模式一（触控板双指滑动）与模式二/三（滚轮条）使用。
-     */
+    /** 提交双指滚动（像素位移），供模式一与模式二/三的滚轮条使用。 */
     fun submitScroll(dxPx: Float, dyPx: Float) {
         touchHandler.onScroll(dxPx, dyPx)
     }
 
     /**
      * 体感模式的光标位移：做亚像素累积后取整发出。
-     *
-     * 传感器以浮点速度积分出像素，若直接取整会丢掉小数（与触控通路同一问题），
-     * 因此在 ViewModel 这一层统一累积。
+     * 传感器以浮点速度积分出像素，直接取整会丢掉小数（与触控通路同一问题）。
      */
     private var sensorResidualX = 0f
     private var sensorResidualY = 0f
@@ -325,3 +392,4 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         touchHandler.buttons and mask.inv()
     }
 }
+
