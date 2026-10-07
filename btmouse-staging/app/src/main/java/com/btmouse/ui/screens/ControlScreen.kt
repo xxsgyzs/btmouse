@@ -31,39 +31,36 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import com.btmouse.core.state.HidMode
 import com.btmouse.ui.MainViewModel
 
 /**
  * ControlScreen —— 控制页（模式一/二/三共用同一套骨架）
  *
- * ██ BATCH-5 重构 ██
- *
- *  1. **顶部改为 Scaffold + TopAppBar**：左侧「← 模式名」，与设置页样式统一；
- *     **废除原先右上角的 × 按钮**（位置反直觉、且与顶边过近容易点不中）。
- *     退出统一走左上角返回箭头，系统返回键行为不变。
- *
- *  2. **操作栏下移到 TopAppBar 之下的第一行**：左键 / 滚轮条 / 右键 三件横向排布，
- *     热区分别为 76dp / 72dp，滚轮条可拖动。
- *
- *  3. **删除底部冗余的大滚轮条**：原先底部还有一条 72dp 滚轮条，
- *     与顶部滚轮功能重复且占据大片空间，现已移除（滚轮改由顶部滚轮条承担）。
- *
- *  4. **点击失效的修复思路**：把「按钮区」与「手势区」做成**互不重叠的兄弟节点**。
- *     Compose 的命中测试只把事件派发给最深命中的那个 pointerInput 节点，
- *     因此只要手势区不覆盖按钮区，按钮就不可能被"吃掉"。
- *     同时**不再使用 PointerEventPass.Main 抢事件**的写法，避免与子节点竞争。
- *
  * 布局：
  *   ┌──────────────────────────────────────┐
- *   │ ← 触控板模式 / 设备名                  │  TopAppBar
+ *   │ ← 模式名 / 设备名                      │  TopAppBar（返回箭头走 onExit）
  *   ├──────────────────────────────────────┤
- *   │ [左键]      ↕滚轮条       [右键]       │  操作栏
+ *   │ [左键]      ↕滚轮条       [右键]       │  操作栏（zIndex 提升命中优先级）
  *   ├──────────────────────────────────────┤
  *   │                                      │
- *   │          手势区 / 提示区               │
+ *   │        手势区 / 提示区                 │
  *   │                                      │
  *   └──────────────────────────────────────┘
+ *
+ * ██ BATCH-5.1 说明 ██
+ *
+ *  1. **返回箭头**：`navigationIcon` 的 `IconButton(onClick = onExit)` 直接把回调交给
+ *     MainActivity 的自实现导航（`onExit = { screen = AppScreen.CONNECT }`）。
+ *     本页手势区此前会过早消费事件，导致箭头点不动 —— 已在 TrackpadScreen 中
+ *     改为只在 `PointerEventPass.Final`、且仅在实际拖动后消费，从结构上让出优先权。
+ *
+ *  2. **操作栏命中优先级**：给操作栏加 zIndex 并在 Column 中**先声明手势区、
+ *     后声明操作栏**。Compose 的命中测试对同层兄弟按声明顺序倒序处理，
+ *     加上 zIndex 后按钮的命中优先级被显式抬到最高，不再依赖隐式顺序。
+ *
+ *  3. 原先右上角的 × 按钮已废除，退出统一走左上角返回箭头。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -94,6 +91,7 @@ fun ControlScreen(
                     }
                 },
                 navigationIcon = {
+                    // 直接绑定 onExit（MainActivity 传入：回到连接页）
                     IconButton(onClick = onExit) {
                         Icon(
                             imageVector = BackArrowIcon,
@@ -113,9 +111,26 @@ fun ControlScreen(
                 .padding(innerPadding)
                 .padding(horizontal = 12.dp)
         ) {
-            // ---------------- 操作栏：左键 / 滚轮条 / 右键 ----------------
+            // ---------------- 手势区 / 提示区（先声明 → 层级在下）----------------
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
+                if (mode == HidMode.TRACKPAD) {
+                    TrackpadScreen(vm = vm, modifier = Modifier.fillMaxSize())
+                } else {
+                    SensorHintArea(mode = mode, modifier = Modifier.fillMaxSize())
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // ---------------- 操作栏（后声明 + zIndex → 命中优先级最高）----------------
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .zIndex(1f),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -136,25 +151,6 @@ fun ControlScreen(
                     onClickPressed = { vm.setRightPressed(it) }
                 )
             }
-
-            Spacer(Modifier.height(12.dp))
-
-            // ---------------- 手势区（模式一）/ 提示区（模式二、三） ----------------
-            if (mode == HidMode.TRACKPAD) {
-                TrackpadScreen(
-                    vm = vm,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                )
-            } else {
-                SensorHintArea(
-                    mode = mode,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                )
-            }
         }
     }
 }
@@ -162,7 +158,7 @@ fun ControlScreen(
 /**
  * 模式二/三的中央提示区。
  *
- * 纯展示、**不接收任何手势**——这样它绝不会与上方操作栏竞争事件。
+ * 纯展示、**不接收任何手势**——这样它绝不会与操作栏竞争事件。
  */
 @Composable
 private fun SensorHintArea(
@@ -211,11 +207,8 @@ private fun SensorHintArea(
 /**
  * 可拖动的滚轮条：上下拖动即滚动页面。
  *
- * 与触控板双指滚轮走同一条通路（[MainViewModel.submitScroll]），
+ * 与触控板双指滚轮走同一条通路（MainViewModel.submitScroll），
  * 因此设置页里调的"滚轮速度"对所有滚轮入口同时生效。
- *
- * 说明：使用 [detectDragGestures]，它在手指移动超过 touchSlop 后才开始上报，
- * 因此**不会吞掉**落在其上的点击类事件。
  */
 @Composable
 internal fun RollerStrip(
